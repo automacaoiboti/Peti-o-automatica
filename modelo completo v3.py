@@ -5,14 +5,12 @@ from docx import Document
 from docx.shared import Pt, Inches
 from docx.enum.text import WD_ALIGN_PARAGRAPH
 from openai import OpenAI
-from dotenv import load_dotenv
-from supabase import create_client
-from urllib.parse import quote
 from datetime import datetime
+from urllib.parse import quote
+from supabase import create_client
 import os
 
-# Carrega variáveis do ambiente
-load_dotenv()
+# Carrega variáveis de ambiente (Render usará ENV diretamente)
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 SUPABASE_URL = os.getenv("SUPABASE_URL")
 SUPABASE_KEY = os.getenv("SUPABASE_KEY")
@@ -22,7 +20,7 @@ BUCKET = "peticoesgeradas"
 client = OpenAI(api_key=OPENAI_API_KEY)
 supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
 
-# Inicializa API
+# Inicializa FastAPI
 app = FastAPI()
 app.add_middleware(
     CORSMiddleware,
@@ -36,13 +34,13 @@ app.add_middleware(
 def contar_tokens(texto):
     return len(texto.split())
 
-# Gera nome de arquivo único com reclamante + timestamp
+# Gera nome de arquivo único
 def gerar_nome_arquivo(dados_usuario):
     nome_base = dados_usuario.get('reclamante', 'anonimo').replace(' ', '_')
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     return f"peticao_{nome_base}_{timestamp}.docx"
 
-# IA reescreve parágrafos com base no contexto e seção
+# IA reescreve parágrafos com base no contexto
 def reescrever_com_ia(paragrafos, contexto_usuario: dict):
     texto_final = ""
     custo_total = 0
@@ -77,9 +75,9 @@ def reescrever_com_ia(paragrafos, contexto_usuario: dict):
                 temperature=0.4
             )
             texto_revisado = resposta.choices[0].message.content.strip()
-            print(f"\n--- [{modelo}] Seção: {secao_atual} ---\n{texto}\n→ {texto_revisado}\n")
+            print(f"\n--- [{modelo}] {secao_atual} ---\n→ {texto_revisado[:100]}...\n")
         except Exception as e:
-            texto_revisado = f"[ERRO NA IA] {par}"
+            texto_revisado = f"[ERRO IA] {par}"
             print(f"Erro: {e}")
 
         texto_final += texto_revisado + "\n\n"
@@ -92,19 +90,9 @@ def reescrever_com_ia(paragrafos, contexto_usuario: dict):
 
     return texto_final.strip(), custo_total
 
-# Formata texto no Word com estilo jurídico
-def formatar_documento_visualmente(texto_formatado, caminho_saida, caminho_imagem_cabecalho=None):
+# Formata e salva documento
+def formatar_documento_visualmente(texto_formatado, caminho_saida):
     doc = Document()
-
-    if caminho_imagem_cabecalho and os.path.isfile(caminho_imagem_cabecalho):
-        section = doc.sections[0]
-        header = section.header
-        for p in header.paragraphs:
-            p.clear()
-        p = header.paragraphs[0]
-        run = p.add_run()
-        run.add_picture(caminho_imagem_cabecalho, width=Inches(2.5))
-        p.alignment = WD_ALIGN_PARAGRAPH.CENTER
 
     for par in texto_formatado.split("\n"):
         texto = par.strip()
@@ -130,15 +118,16 @@ def formatar_documento_visualmente(texto_formatado, caminho_saida, caminho_image
     footer.alignment = WD_ALIGN_PARAGRAPH.CENTER
     doc.save(caminho_saida)
 
-# Envia o .docx para o Supabase e retorna a URL pública
+# Envia para Supabase
 def enviar_para_supabase(caminho_local, nome_arquivo):
     with open(caminho_local, "rb") as f:
         dados = f.read()
 
-    caminho_remoto = nome_arquivo
-    supabase.storage.from_(BUCKET).upload(caminho_remoto, dados, {
-        "content-type": "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
-    })
+    supabase.storage.from_(BUCKET).upload(
+        nome_arquivo,
+        dados,
+        {"content-type": "application/vnd.openxmlformats-officedocument.wordprocessingml.document"}
+    )
 
     url = f"{SUPABASE_URL}/storage/v1/object/public/{BUCKET}/{quote(nome_arquivo)}"
     return url
@@ -149,20 +138,21 @@ async def gerar_peticao(request: Request):
     dados = await request.json()
 
     nome_arquivo = gerar_nome_arquivo(dados)
-    caminho_modelo = "c:/Users/escri/Documents/Petição inicial/modelos/modelo_base.docx"
-    caminho_saida = f"./output/{nome_arquivo}"
-    imagem_cabecalho = "C:/Users/escri/Documents/logo_iboti.jpg"
+    caminho_saida = f"/tmp/{nome_arquivo}"  # Pasta segura no Render
 
-    os.makedirs("output", exist_ok=True)
-
-    if not os.path.isfile(caminho_modelo):
-        return {"erro": f"Modelo não encontrado: {caminho_modelo}"}
-
-    doc = Document(caminho_modelo)
-    paragrafos = [p.text for p in doc.paragraphs]
+    # Use seu modelo docx no Supabase ou crie texto direto (aqui é gerado do zero via IA)
+    paragrafos = [
+        "EXCELENTÍSSIMO SENHOR DOUTOR JUIZ DO TRABALHO DA VARA DO TRABALHO DE [CIDADE].",
+        "FATOS",
+        "O Reclamante laborou na empresa por mais de 5 anos, exercendo função de motorista.",
+        "FUNDAMENTAÇÃO",
+        "O vínculo empregatício está comprovado por meio dos documentos anexos.",
+        "PEDIDOS",
+        "Requer o pagamento das verbas rescisórias, horas extras e FGTS não depositado."
+    ]
 
     texto_revisado, custo = reescrever_com_ia(paragrafos, dados)
-    formatar_documento_visualmente(texto_revisado, caminho_saida, imagem_cabecalho)
+    formatar_documento_visualmente(texto_revisado, caminho_saida)
     url_download = enviar_para_supabase(caminho_saida, nome_arquivo)
 
     return {
@@ -171,7 +161,6 @@ async def gerar_peticao(request: Request):
         "custo_estimado_usd": round(custo, 4)
     }
 
-# Rota preflight para CORS
 @app.options("/gerar-peticao")
 async def options_gerar_peticao():
     return {"status": "ok"}
